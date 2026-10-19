@@ -11,7 +11,7 @@
 替换或删除里面的内容，而且它**不在任何版本控制之下**。这个 fork 里 500 多行本地改动
 （failover、会话授权门、lab 禁令）没有任何上游来源可以找回。
 
-本目录放在 Nextcloud 同步盘里，同时提供两件事：
+本目录放在一个独立于 Pi 的同步盘目录里，同时提供两件事：
 
 1. **离线副本** —— 运行位置被清掉时能整套还原
 2. **历史** —— 每次升级或修 bug 都有一个可回溯的提交点
@@ -28,7 +28,7 @@ Pi 通过 `~/.pi/agent/settings.json` 里的 `"./local-plugins/rpiv-advisor-loca
 验证两边是否一致：
 
 ```bash
-cd "/f/Nextcloud/project/PI插件/rpiv-advisor-local"
+cd "$BACKUP"
 git status --short          # 空 = 与上次提交一致
 ```
 
@@ -40,26 +40,26 @@ git status --short          # 空 = 与上次提交一致
 
 ```bash
 SRC=~/.pi/agent/local-plugins/rpiv-advisor-local
-DST="/f/Nextcloud/project/PI插件/rpiv-advisor-local"
+BACKUP="/path/to/backup/rpiv-advisor-local"   # 本仓库所在位置
 
 # 1. 先在运行位置验证（这步不能跳）
 cd "$SRC" && node check-upstream-merge.mjs && node run-tests.mjs
 
 # 2. 同步源文件（排除依赖与构建产物）
 tar --exclude=node_modules --exclude=work --exclude=.upgrade-stage \
-    -cf - . 2>/dev/null | (cd "$DST" && tar xf -)
+    -cf - . 2>/dev/null | (cd "$BACKUP" && tar xf -)
 
 # 3. 提交
-cd "$DST" && git add -A && git status --short && git commit -m "<说明>"
+cd "$BACKUP" && git add -A && git status --short && git commit -m "<说明>"
 ```
 
 ### 运行位置出问题，从本目录还原
 
 ```bash
 SRC=~/.pi/agent/local-plugins/rpiv-advisor-local
-DST="/f/Nextcloud/project/PI插件/rpiv-advisor-local"
+BACKUP="/path/to/backup/rpiv-advisor-local"   # 本仓库所在位置
 
-cd "$DST" && tar --exclude=.git --exclude=.gitignore --exclude=.gitattributes \
+cd "$BACKUP" && tar --exclude=.git --exclude=.gitignore --exclude=.gitattributes \
     -cf - . 2>/dev/null | (cd "$SRC" && tar xf -)
 
 # 还原后必须重新装依赖（node_modules 不在仓库里）

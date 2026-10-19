@@ -193,7 +193,7 @@ cline/cline-pass/deepseek-v4.1-flash
 
 > `pi-multi-account`（账号轮换插件）**完全看不见 advisor 的失败**，不会为它切换账号。
 
-实测证据：两次 advisor 失败（`Codex error: The usage limit has been reached`）在该插件的
+实测证据：两次 advisor 失败（provider 返回的额度耗尽错误）在该插件的
 `provider-failover-debug.log` 里**零条目**。也就是说，一个账号耗尽就会让 advisor 直接挂掉，
 而旁边健康的备用账号完全用不上。
 

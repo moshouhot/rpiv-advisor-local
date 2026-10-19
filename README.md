@@ -1,127 +1,128 @@
-# @juicesharp/rpiv-advisor
+# rpiv-advisor-local
 
-[![npm version](https://img.shields.io/npm/v/@juicesharp/rpiv-advisor.svg)](https://www.npmjs.com/package/@juicesharp/rpiv-advisor)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+**Unofficial local fork of [`@juicesharp/rpiv-advisor`](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-advisor).**
 
-<div align="center">
-  <a href="https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-advisor">
-    <picture>
-      <img src="https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-advisor/docs/cover.png" alt="rpiv-advisor cover: an executor model calling advisor() and a stronger reviewer answering with a plan, a correction, or a stop signal" width="50%">
-    </picture>
-  </a>
-</div>
+Not affiliated with, endorsed by, or maintained by the upstream author.
+All upstream credit belongs to [juicesharp](https://github.com/juicesharp);
+this repository only adds a personal patch set on top of 2.13.8.
 
-Let the model you're working with hand its whole conversation to a second, stronger model and get back a plan, a correction, or a stop signal — then keep going. `rpiv-advisor` adds the zero-parameter `advisor` tool and the `/advisor` picker to [Pi Agent](https://github.com/badlogic/pi-mono), so you can drive a session with a fast model and keep a stronger reviewer one call away.
+> Upstream is the right choice for almost everyone:
+> `pi install npm:@juicesharp/rpiv-advisor`
 
-## Install
+---
+
+## What this fork adds
+
+### 1. Cross-account retry for the advisor call
+
+The advisor's completion call uses pi-ai's `completeSimple()` directly, bypassing
+Pi's agent loop. It therefore emits no `message_end` / `assistant_error` events,
+so account-rotation extensions are blind to advisor failures: one exhausted
+account takes the advisor down while healthy siblings sit idle.
+
+This fork retries the **same model id** on sibling accounts of the same family
+(provider name minus the `-account-<N>` suffix). It never changes the model —
+only which credentials answer it.
+
+The classifier is deliberately narrow: it matches quota/credential exhaustion
+(`insufficient_quota`, `usage limit`, `401/403`), and explicitly excludes
+service-side failures such as `503` / `overloaded`, which should surface as-is
+rather than burn through every sibling account.
+
+### 2. Per-session opt-in
+
+The advisor is **off by default** in every session. It activates only when you
+ask for it in that session:
+
+| Input | Effect |
+|---|---|
+| `call the advisor` / `ask advisor to review this` / 调用 advisor | enables this session |
+| `don't call the advisor` / 别用 advisor | stays off (negation-aware) |
+| `what does the advisor do?` / 上次 advisor 说了什么 | stays off (not imperative) |
+| `/advisor on` / `/advisor off` | session toggle |
+| `/advisor always on` / `always off` | default for future sessions |
+| new session / process restart | follows the recorded default |
+| `/reload` | authorization survives (written to the session ledger) |
+
+Rationale: an advisor call ships the entire conversation (~130K tokens) to a
+second, external model. Making that a per-session explicit act rather than a
+standing default is a deliberate privacy/cost boundary.
+
+### 3. Hard block in "lab" environments
+
+When `~/.pi/agent/lab-mode.flag` exists, the advisor is unavailable regardless of
+authorization. The gate **suspends** rather than revokes: leaving lab mode
+restores the previous state, and `/advisor always on` still works across a lab
+session.
+
+---
+
+## Status and scope
+
+Version `2.13.8-personal`, based on upstream `2.13.8`.
+
+Verified on the committed tree: 43 static assertions, 55 behavioural tests
+(24 failover + 31 opt-in/lab), and a same-version rebuild that reproduces the
+plugin tree byte-for-byte from the frozen baseline.
+
+**This is a personal fork, maintained for one setup.** It is published because
+the upgrade machinery may be useful to others, not as a supported distribution.
+The opt-in default and lab gate are opinions about how *my* sessions should
+behave; they are not claims about what upstream ought to do, and this fork does
+not send changes upstream.
+
+---
+
+## Layout
+
+| Path | Contents |
+|---|---|
+| `advisor/` | Fork source. `fallback.ts`, `session-optin.ts`, `lab-mode.ts` are fork-only |
+| `.upstream/baseline/` | Complete upstream 2.13.8 package (23 files) — the diff base |
+| `.upstream/personal.patch` | Every local change: 9 files, 952 lines |
+| `.upstream/MANIFEST.md` `.json` | File classification and per-file sha256 |
+| `AGENTS.md` | Hard constraints for AI-assisted work on this repo |
+| `UPGRADING.md` | Mechanical procedure for rebasing onto a new upstream |
+| `upgrade-check.mjs` | Stages a candidate and verifies it without touching the live plugin |
+| `PERSONAL_MAINTENANCE.md` | Design rationale and change specifications |
+
+### Why the upgrade assets are the interesting part
+
+Rebasing a 500-line local patch by hand onto a moving upstream fails quietly.
+Instead, every local change is frozen into `.upstream/personal.patch`, applied
+with `patch -p1 -F0` (no fuzz), and verified in a throwaway stage:
 
 ```sh
-pi install npm:@juicesharp/rpiv-advisor
+node upgrade-check.mjs --from <unpacked-upstream> --expect-version <version>
 ```
 
-Restart your Pi session.
+Exit codes: `0` pass / `1` check failed / `2` cannot build (patch conflict,
+missing asset) / `3` environment. On conflict the stage is kept with `.rej`
+files, so only the failing hunks need human attention.
 
-## Quick start
+`package.json` deliberately stays out of the patch: its version and dependency
+ranges churn every release, so a byte-level patch would conflict every time.
+It is regenerated from `.upstream/package.overrides.json` instead.
 
-Nothing happens until you pick a reviewer. Run:
+---
 
-```
-/advisor
-```
+## Notes for anyone reusing this
 
-You get a picker over every model Pi already has credentials for — start typing
-to filter it by model name, provider, or `provider/id`. Pick one, and if it
-supports reasoning you get a second picker for its effort level (`high` is
-recommended). Pi confirms with `Advisor: <model>, <effort>`, and the `advisor`
-tool goes live for this and every future session.
+- The fork-only files (`advisor/fallback.ts`, `advisor/session-optin.ts`,
+  `advisor/lab-mode.ts`) do not exist upstream, so `cp *.ts` over this tree will
+  not clobber them — but `cp` of the nine *patched* files will silently drop the
+  local functionality. `AGENTS.md` lists them.
+- `~/.pi/agent/settings.json` package entries must be plain strings
+  (`"./local-plugins/rpiv-advisor-local"`). The object form with an empty
+  `extensions` array is a filter that matches nothing and silently disables the
+  entire package.
+- Two Node/Windows quirks are worked around in the scripts and should stay that
+  way: `fs.cpSync` crashes the process on non-ASCII paths, and
+  `fs.rmSync(recursive)` reports success while leaving the tree behind.
 
-If the model you want isn't in the list, its provider isn't authenticated yet —
-run Pi's `/login` for that provider, then re-run `/advisor`.
-
-![The /advisor picker: a bordered panel titled "Advisor Tool" above a scrollable list of the models Pi has credentials for, with the current selection highlighted](https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-advisor/docs/advisor.jpg)
-
-From there the executor model calls `advisor()` on its own when it needs stronger
-judgment. To turn it back off, run `/advisor` and choose **No advisor**.
-
-## What you get
-
-- **A second opinion without leaving the session** — the executor calls
-  `advisor()` mid-turn, reads the reviewer's answer as the tool result, and
-  resumes. Nothing is injected into your transcript, and the default prompt
-  guidelines tell the executor to restate the advisor's key guidance in its
-  next visible reply, so you are not left with only a collapsed tool card.
-- **Nothing to type or paste** — the tool takes zero parameters. The whole
-  conversation branch is serialised and forwarded automatically: the task, every
-  tool call made, every result seen. That whole branch is billed against the
-  reviewer model on every call, so escalations are not free.
-- **The reviewer sees what survived compaction** — the branch is built from Pi's
-  resolved LLM context, so compaction and branch summaries are forwarded instead
-  of a stale raw replay.
-- **Any model can be the reviewer** — every model you're authenticated for is in
-  the `/advisor` picker, found by fuzzy-typing. No provider is privileged.
-- **Pick once, it stays picked** — model and effort persist to `advisor.json`
-  and are re-applied at every session start.
-- **Skip it when you're already on a strong model** — list executor models in
-  `disabledForModels` to strip the tool for them, optionally only at or above a
-  reasoning-effort threshold. It strips and re-adds live as you switch model or
-  effort mid-session.
-- **Off costs nothing** — with no model selected the tool is stripped from the
-  active set, so its prompt text never enters the system prompt at all.
-
-## Configuration
-
-Settings live in `~/.config/rpiv-advisor/advisor.json` (or
-`$XDG_CONFIG_HOME/rpiv-advisor/advisor.json` when that variable is set to an
-absolute path). `/advisor` creates the file and chmods it to `0600`; a failed
-write leaves your previous selection untouched and tells you so.
-
-| Key | What it does | Default |
-| --- | --- | --- |
-| `modelKey` | The reviewer model, as `"provider/modelId"`. Written by `/advisor`. | absent — advisor off |
-| `effort` | Reasoning effort for the reviewer: `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Written by `/advisor`; only levels supported by the selected model are offered. | absent — no reasoning sent |
-| `disabledForModels` | Executor models the advisor is stripped for. Plain strings block at any effort; `{ "model": "…", "minEffort": "…" }` blocks only at or above that effort. | `[]` |
-
-```json
-{
-  "modelKey": "anthropic/claude-opus-4-5",
-  "effort": "high",
-  "disabledForModels": [
-    "anthropic/claude-opus-4-5",
-    { "model": "openai/gpt-5.2", "minEffort": "high" }
-  ]
-}
-```
-
-`/advisor` only rewrites `modelKey` and `effort`, so hand-edited keys —
-`disabledForModels` and the `guidance` overrides — survive every save.
-
-## Reference
-
-- [Configuration](https://github.com/juicesharp/rpiv-mono/blob/main/packages/rpiv-advisor/docs/configuration.md) — config file resolution, every key, blocklist matching rules, guidance overrides, and the full notification catalogue.
-- [`advisor` tool reference](https://github.com/juicesharp/rpiv-mono/blob/main/packages/rpiv-advisor/docs/tool-reference.md) — schema, result envelope, failure paths, what gets sent to the reviewer, lifecycle hooks, and picker keys.
-
-## Requirements
-
-- A [Pi Agent](https://github.com/badlogic/pi-mono) host — the extension loads
-  through Pi's extension manifest. No native dependencies.
-- An authenticated provider for the **reviewer** model, resolved through Pi's
-  model registry.
-- An interactive terminal for `/advisor`.
-
-## Troubleshooting
-
-| Symptom | Cause | Fix |
-| --- | --- | --- |
-| The `/advisor` picker offers only **No advisor** | No provider is authenticated in Pi | Run Pi's `/login` for a provider, then re-run `/advisor` |
-| `Advisor (<model>) has no API key available.` comes back as the tool result | Credentials for the reviewer's provider no longer resolve | Re-authenticate that provider with `/login` |
-| `/advisor requires interactive mode` | Running under `pi --print …` or RPC | Run Pi interactively |
-
-## Related
-
-- [`@juicesharp/rpiv-pi`](https://www.npmjs.com/package/@juicesharp/rpiv-pi) —
-  the umbrella package; its `code-review` skill calls `advisor()` when this
-  package is installed.
+---
 
 ## License
 
-MIT — see [LICENSE](https://github.com/juicesharp/rpiv-mono/blob/main/packages/rpiv-advisor/LICENSE).
+MIT, same as upstream. See [`LICENSE`](LICENSE) — copyright for the original
+work belongs to juicesharp; this fork's changes carry no additional restrictions.
