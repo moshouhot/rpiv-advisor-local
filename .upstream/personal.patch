@@ -1,0 +1,952 @@
+--- a/advisor/command.ts
++++ b/advisor/command.ts
+@@ -12,8 +12,8 @@
+ import type { SelectItem } from "@earendil-works/pi-tui";
+ import { modelKey } from "@juicesharp/rpiv-config";
+ import { showAdvisorPicker, showEffortPicker } from "../advisor-ui.js";
+-import { saveAdvisorConfig } from "./config.js";
+-import { reconcileAdvisorTool } from "./handlers.js";
++import { saveAdvisorConfig, saveAdvisorDefaultEnabled } from "./config.js";
++import { reconcileAdvisorTool, refreshAdvisorStatus } from "./handlers.js";
+ import {
+ 	ADVISOR_TOOL_NAME,
+ 	CHECKMARK,
+@@ -22,16 +22,25 @@
+ 	errSelectionNotFound,
+ 	type GradedEffort,
+ 	MSG_ADVISOR_DISABLED,
++	MSG_ADVISOR_LAB_BLOCKED,
++	MSG_ADVISOR_ALWAYS_OFF,
++	MSG_ADVISOR_ALWAYS_PERSIST_FAILED,
++	MSG_ADVISOR_NO_MODEL_CONFIGURED,
+ 	MSG_EFFORT_NOT_SET,
+ 	MSG_PERSIST_FAILED,
+ 	MSG_REQUIRES_INTERACTIVE,
+ 	msgAdvisorEnabled,
+ 	msgAdvisorEnabledInactive,
++	msgAdvisorAlwaysOn,
++	msgAdvisorOnInactive,
++	msgAdvisorSessionOff,
+ 	NO_ADVISOR_VALUE,
+ 	OFF_VALUE,
+ 	RECOMMENDED_EFFORT_SUFFIX,
+ } from "./messages.js";
++import { isLabModeActive } from "./lab-mode.js";
+ import { isExecutorBlocked } from "./policy.js";
++import { recordSessionOptIn, resetSessionOptIn } from "./session-optin.js";
+ import { getAdvisorEffort, getAdvisorModel, setAdvisorEffort, setAdvisorModel } from "./state.js";
+ 
+ // Mirror: packages/rpiv-pi/extensions/rpiv-core/rpiv-models/items.ts
+@@ -82,10 +91,17 @@
+ 	}
+ 	setAdvisorModel(undefined);
+ 	setAdvisorEffort(undefined);
++	// "No advisor" is an explicit revoke: drop this session's opt-in grant too,
++	// otherwise the next before_agent_start would re-add a tool with no model.
++	const sessionId = ctx?.sessionManager?.getSessionId?.();
++	// Recorded, not just cleared: a reload rebuilds from these entries, so a
++	// memory-only revoke would come back on the next reload.
++	recordSessionOptIn(pi, sessionId, false);
+ 	const active = pi.getActiveTools();
+ 	if (active.includes(ADVISOR_TOOL_NAME)) {
+ 		pi.setActiveTools(active.filter((n) => n !== ADVISOR_TOOL_NAME));
+ 	}
++	refreshAdvisorStatus(ctx, sessionId);
+ 	ctx.ui.notify(MSG_ADVISOR_DISABLED, "info");
+ }
+ 
+@@ -106,18 +122,139 @@
+ 	setAdvisorEffort(effort);
+ 	setAdvisorModel(picked);
+ 
++	const sessionId = ctx?.sessionManager?.getSessionId?.();
++
++	// Lab mode refuses the advisor outright. Saving the selection is harmless
++	// (the config is shared with non-lab sessions), but granting here would be
++	// a lie: reconcile strips the tool anyway, so refuse visibly instead.
++	if (isLabModeActive()) {
++		ctx.ui.notify(MSG_ADVISOR_LAB_BLOCKED, "warning");
++		refreshAdvisorStatus(ctx, sessionId);
++		return;
++	}
++
++	// Running /advisor is itself an explicit request for the advisor, so it
++	// grants the current session (parity with typing "调用 advisor"). Without
++	// this the picker would save a model that still cannot be used until a
++	// keyword appears in some later turn.
++	recordSessionOptIn(pi, sessionId, true);
++
+ 	const blocked = isExecutorBlocked(ctx, pi.getThinkingLevel());
+-	reconcileAdvisorTool(pi, ctx, { blocked });
++	reconcileAdvisorTool(pi, ctx, { blocked, sessionId });
++	refreshAdvisorStatus(ctx, sessionId);
+ 	ctx.ui.notify(
+ 		blocked ? msgAdvisorEnabledInactive(modelKey(picked), effort) : msgAdvisorEnabled(modelKey(picked), effort),
+ 		"info",
+ 	);
+ }
+ 
++/**
++ * `/advisor always on|off` — the cross-session default.
++ *
++ * Scope is deliberately narrow: this changes what a session WITHOUT its own
++ * record starts as. It does not touch the current session's record (the user
++ * asked for a default, not a toggle), and it does not weaken the lab-mode
++ * prohibition or the executor blocklist — both are still evaluated per turn.
++ */
++function applyAlways(pi: ExtensionAPI, ctx: ExtensionContext, enabled: boolean): void {
++	if (!saveAdvisorDefaultEnabled(enabled)) {
++		ctx.ui.notify(MSG_ADVISOR_ALWAYS_PERSIST_FAILED, "error");
++		return;
++	}
++	if (enabled) {
++		const model = getAdvisorModel();
++		ctx.ui.notify(msgAdvisorAlwaysOn(model ? modelKey(model) : undefined), "info");
++	} else {
++		ctx.ui.notify(MSG_ADVISOR_ALWAYS_OFF, "info");
++	}
++}
++
++/**
++ * `/advisor off` — revoke this session's grant only.
++ *
++ * Deliberately NOT `applyDisable`: that path also clears the persisted model,
++ * which is a different intent. "off" is the session-scoped counterpart of the
++ * opt-in keyword; wiping the saved model would force a full re-pick next time
++ * the user just wants the tool back.
++ */
++function applySessionOff(pi: ExtensionAPI, ctx: ExtensionContext): void {
++	const sessionId = ctx?.sessionManager?.getSessionId?.();
++	// Recorded, not just cleared: a reload rebuilds from these entries, so a
++	// memory-only revoke would come back on the next reload.
++	recordSessionOptIn(pi, sessionId, false);
++	const active = pi.getActiveTools();
++	if (active.includes(ADVISOR_TOOL_NAME)) {
++		pi.setActiveTools(active.filter((n) => n !== ADVISOR_TOOL_NAME));
++	}
++	refreshAdvisorStatus(ctx, sessionId);
++	const model = getAdvisorModel();
++	ctx.ui.notify(msgAdvisorSessionOff(model ? modelKey(model) : undefined), "info");
++}
++
++/**
++ * `/advisor on` — grant the current session without opening the model picker.
++ *
++ * Requires an already-configured model: granting with none would strip the tool
++ * again on the very next turn (`!getAdvisorModel()` blocks), so the user would
++ * see "enabled" and then nothing.
++ */
++function applySessionOn(pi: ExtensionAPI, ctx: ExtensionContext): void {
++	const model = getAdvisorModel();
++	if (!model) {
++		ctx.ui.notify(MSG_ADVISOR_NO_MODEL_CONFIGURED, "error");
++		return;
++	}
++	if (isLabModeActive()) {
++		ctx.ui.notify(MSG_ADVISOR_LAB_BLOCKED, "warning");
++		return;
++	}
++
++	const sessionId = ctx?.sessionManager?.getSessionId?.();
++	recordSessionOptIn(pi, sessionId, true);
++
++	const blocked = isExecutorBlocked(ctx, pi.getThinkingLevel());
++	reconcileAdvisorTool(pi, ctx, { blocked, sessionId });
++	refreshAdvisorStatus(ctx, sessionId);
++	ctx.ui.notify(
++		blocked
++			? msgAdvisorOnInactive(modelKey(model), getAdvisorEffort())
++			: msgAdvisorEnabled(modelKey(model), getAdvisorEffort()),
++		"info",
++	);
++}
++
+ export function registerAdvisorCommand(pi: ExtensionAPI): void {
+ 	pi.registerCommand("advisor", {
+-		description: "Configure the advisor model for the advisor-strategy pattern",
+-		handler: async (_args, ctx) => {
++		description: "Configure the advisor model; on/off toggle it for this session",
++		getArgumentCompletions: (prefix) => {
++			const items = [
++				{ value: "on", label: "on", description: "Enable the advisor for this session" },
++				{ value: "off", label: "off", description: "Disable the advisor for this session" },
++				{ value: "always on", label: "always on", description: "New sessions start enabled (lab mode still overrides)" },
++				{ value: "always off", label: "always off", description: "New sessions start disabled (default)" },
++			];
++			const p = prefix.trim().toLowerCase();
++			return items.filter((i) => i.value.startsWith(p));
++		},
++		handler: async (args, ctx) => {
++			// `on` / `off` are session-scoped toggles and must work without a
++			// picker, so they are resolved BEFORE the interactive guard: they only
++			// need notify/setStatus, which non-interactive hosts still accept.
++			const sub = args.trim().toLowerCase().replace(/\s+/g, " ");
++			if (sub === "on" || sub === "off") {
++				if (sub === "on") applySessionOn(pi, ctx);
++				else applySessionOff(pi, ctx);
++				return;
++			}
++			if (sub === "always on" || sub === "always off") {
++				applyAlways(pi, ctx, sub === "always on");
++				return;
++			}
++			if (sub) {
++				ctx.ui.notify(`Unknown /advisor argument: "${args.trim()}" (use on, off, always on, always off)`, "error");
++				return;
++			}
++
+ 			if (!ctx.hasUI) {
+ 				ctx.ui.notify(MSG_REQUIRES_INTERACTIVE, "error");
+ 				return;
+--- a/advisor/config.ts
++++ b/advisor/config.ts
+@@ -18,6 +18,15 @@
+ 	effort?: GradedEffort;
+ 	guidance?: GuidanceFields;
+ 	disabledForModels?: DisabledForModelsEntry[];
++	/**
++	 * Default grant for sessions that carry no explicit record of their own.
++	 * Set by `/advisor always on|off`.
++	 *
++	 * This is only the STARTING value. It never overrides an explicit per-session
++	 * record, and it never overrides the lab-mode prohibition — lab work gets no
++	 * advisor whatever this says.
++	 */
++	defaultEnabled?: boolean;
+ }
+ 
+ export function loadAdvisorConfig(): AdvisorConfig {
+@@ -55,3 +64,16 @@
+ 	else delete config.effort;
+ 	return saveJsonConfig(ADVISOR_CONFIG_PATH, config);
+ }
++
++/**
++ * Persist the cross-session default grant.
++ *
++ * Kept separate from `saveAdvisorConfig`: that one writes modelKey/effort and
++ * deletes absent fields, so routing the flag through it would risk dropping the
++ * model selection on an unrelated toggle.
++ */
++export function saveAdvisorDefaultEnabled(enabled: boolean): boolean {
++	const existing = loadAdvisorConfig();
++	const config: AdvisorConfig = { ...existing, defaultEnabled: enabled };
++	return saveJsonConfig(ADVISOR_CONFIG_PATH, config);
++}
+--- a/advisor/execute.ts
++++ b/advisor/execute.ts
+@@ -16,6 +16,12 @@
+ 	type ExtensionContext,
+ } from "@earendil-works/pi-coding-agent";
+ import { ensureUserTailForAdvisor, stripInflightAdvisorCall, stripToolDeclarations } from "./context.js";
++import {
++	type AdvisorAttemptFailure,
++	buildAdvisorCandidates,
++	errAllCandidatesFailed,
++	isRetryableAdvisorError,
++} from "./fallback.js";
+ import { getInventoryMessage } from "./inventory.js";
+ import {
+ 	ERR_ABORTED_DETAIL,
+@@ -24,10 +30,10 @@
+ 	ERR_EMPTY_RESPONSE_DETAIL,
+ 	ERR_NO_MODEL,
+ 	ERR_NO_MODEL_SELECTED,
++	ERR_UNKNOWN,
+ 	errCallFailed,
+ 	errCallThrew,
+ 	errMisconfigured,
+-	errNoApiKey,
+ 	errNoApiKeyDetail,
+ 	msgConsulting,
+ } from "./messages.js";
+@@ -85,6 +91,52 @@
+ 	return buildAdvisorResult({ text: userText, effort, advisorLabel, errorMessage });
+ }
+ 
++/**
++ * Preserve the pre-patch error wording when only one candidate failed, so the
++ * single-account case reads exactly as it did before the failover patch. Reasons
++ * are the provider's own strings and never carry credentials or headers.
++ */
++function singleFailureText(failure: AdvisorAttemptFailure): string {
++	if (failure.stage === "credentials") {
++		return errMisconfigured(failure.label, failure.reason);
++	}
++	return errCallFailed(failure.reason);
++}
++
++// Terminal envelope for an aborted/error stopReason, or undefined when the
++// attempt produced a normal stop whose text (or lack of text) the caller must
++// still resolve. Used for the R6.4 empty-response retry, where an aborted/error
++// second attempt must short-circuit rather than be treated as another empty
++// response. `label` is the candidate that actually answered, not the configured
++// primary — the details must name the account the tokens were spent on.
++function stopReasonEnvelope(
++	r: AssistantMessage,
++	label: string,
++	effort: ThinkingLevel | undefined,
++): AgentToolResult<AdvisorDetails> | undefined {
++	if (r.stopReason === "aborted") {
++		return buildAdvisorResult({
++			text: ERR_CALL_ABORTED,
++			effort,
++			advisorLabel: label,
++			usage: r.usage,
++			stopReason: r.stopReason,
++			errorMessage: r.errorMessage ?? ERR_ABORTED_DETAIL,
++		});
++	}
++	if (r.stopReason === "error") {
++		return buildAdvisorResult({
++			text: errCallFailed(r.errorMessage),
++			effort,
++			advisorLabel: label,
++			usage: r.usage,
++			stopReason: r.stopReason,
++			errorMessage: r.errorMessage,
++		});
++	}
++	return undefined;
++}
++
+ export async function executeAdvisor(
+ 	ctx: ExtensionContext,
+ 	pi: ExtensionAPI,
+@@ -101,18 +153,11 @@
+ 	}
+ 	const advisorLabel = `${advisor.provider}:${advisor.id}`;
+ 
+-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(advisor);
+-	if (!auth.ok) {
+-		return buildErrorResult(advisorLabel, effort, errMisconfigured(advisorLabel, auth.error), auth.error);
+-	}
+ 	// OAuth-backed providers resolve `{ ok: true }` with no literal apiKey — their
+ 	// credentials are applied inside Pi's runtime facade. A missing key is only
+ 	// fatal on legacy hosts without that facade, where the global completion
+ 	// fallback needs the key passed explicitly.
+ 	const runtimeCompleteSimple = getRuntimeCompleteSimple(ctx.modelRegistry);
+-	if (!auth.apiKey && !runtimeCompleteSimple) {
+-		return buildErrorResult(advisorLabel, effort, errNoApiKey(advisorLabel), errNoApiKeyDetail(advisor.provider));
+-	}
+ 
+ 	// Live-read every call — advisor runs mid-turn so any message_end snapshot
+ 	// is always one turn stale. buildSessionContext() preserves Pi's resolved
+@@ -135,6 +180,10 @@
+ 		details: { advisorModel: advisorLabel, effort },
+ 	});
+ 
++	// Candidate-independent work, hoisted out of the retry loop: the session
++	// branch and tool inventory are identical for every account, and rebuilding
++	// them per attempt would also risk the attempts diverging.
++	let completeSimple: typeof import("@earendil-works/pi-ai/compat").completeSimple;
+ 	try {
+ 		// Prefer Pi's auth-aware runtime facade (resolved once above, before the
+ 		// missing-key guard). Unlike the global compatibility function, it runs
+@@ -142,64 +191,135 @@
+ 		// Copilot's OAuth-specific baseUrl. Do not pass the preflight key/headers
+ 		// to this path: explicit overrides would bypass that resolution and
+ 		// reintroduce the endpoint mismatch.
+-		const completeSimple = runtimeCompleteSimple ?? (await loadCompleteSimple());
++		completeSimple = runtimeCompleteSimple ?? (await loadCompleteSimple());
++	} catch (err) {
++		const message = err instanceof Error ? err.message : String(err);
++		return buildErrorResult(advisorLabel, effort, errCallThrew(message), message);
++	}
++
++	// LOCAL PATCH: account-level failover. The advisor's completion call bypasses
++	// Pi's agent loop, so it emits no message_end/assistant_error events and any
++	// account-rotation extension is blind to an advisor failure. Retrying the SAME
++	// model id on a sibling account is therefore the only way a spent account
++	// cannot take the advisor down. Candidates are [configured primary, ...siblings]
++	// — the configured reviewer is never displaced by a different account.
++	//
++	// `getAll` is a host API that older hosts may not expose; falling back to the
++	// primary alone degrades to the pre-patch single-account behaviour instead of
++	// throwing.
++	const available = ctx.modelRegistry.getAll?.() ?? [];
++	const candidates = buildAdvisorCandidates(available, advisor);
++	const failures: AdvisorAttemptFailure[] = [];
++
++	// Resolve credentials PER CANDIDATE. Hoisting them would authenticate every
++	// attempt with the primary's headers, i.e. keep hammering the account that just
++	// refused while claiming to try its sibling.
++	for (const candidate of candidates) {
++		const label = `${candidate.provider}:${candidate.id}`;
++
++		// Cancellation is re-checked before each attempt: a retry started after the
++		// caller aborted would be another billable request nobody is waiting for.
++		if (signal?.aborted) {
++			return buildErrorResult(label, effort, ERR_CALL_ABORTED, ERR_ABORTED_DETAIL);
++		}
++
++		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(candidate);
++		if (!auth.ok) {
++			failures.push({ label, stage: "credentials", reason: auth.error });
++			continue;
++		}
++		if (!auth.apiKey && !runtimeCompleteSimple) {
++			failures.push({
++				label,
++				stage: "credentials",
++				reason: errNoApiKeyDetail(candidate.provider),
++			});
++			continue;
++		}
++
+ 		const requestOptions = runtimeCompleteSimple
+ 			? { signal, reasoning: effort }
+ 			: { apiKey: auth.apiKey, headers: auth.headers, signal, reasoning: effort };
+ 
++		// Announce the candidate actually being consulted. Only the `advisorModel`
++		// value changes between attempts — the update keeps its existing shape, and
++		// `effort` stays the value snapshotted at entry.
++		if (label !== advisorLabel) {
++			onUpdate?.({
++				content: [{ type: "text", text: msgConsulting(label, effort) }],
++				details: { advisorModel: label, effort },
++			});
++		}
++
+ 		// Single dispatch point — both attempts reuse the SAME `messages` and
+ 		// `requestOptions`, so the retry cannot diverge from attempt 1. `tools: []`
+ 		// plus stripToolDeclarations keeps the "never calls tools" contract: on
+ 		// Pi >= 1.0 the transcript's system messages declare tools of their own.
+ 		const callAdvisor = (): Promise<AssistantMessage> =>
+-			completeSimple(advisor, { systemPrompt: ADVISOR_SYSTEM_PROMPT, messages, tools: [] }, requestOptions);
++			completeSimple(candidate, { systemPrompt: ADVISOR_SYSTEM_PROMPT, messages, tools: [] }, requestOptions);
+ 
+-		// Build the terminal envelope for an aborted/error stopReason, or return
+-		// undefined when the attempt produced a normal stop whose text (or lack of
+-		// text) the caller must still resolve. Aborted/error short-circuit and are
+-		// NEVER retried — they are not the empty-response class R6.4 targets.
+-		const stopReasonEnvelope = (r: AssistantMessage): AgentToolResult<AdvisorDetails> | undefined => {
+-			if (r.stopReason === "aborted") {
+-				return buildAdvisorResult({
+-					text: ERR_CALL_ABORTED,
+-					effort,
+-					advisorLabel,
+-					usage: r.usage,
+-					stopReason: r.stopReason,
+-					errorMessage: r.errorMessage ?? ERR_ABORTED_DETAIL,
+-				});
+-			}
+-			if (r.stopReason === "error") {
+-				return buildAdvisorResult({
+-					text: errCallFailed(r.errorMessage),
+-					effort,
+-					advisorLabel,
+-					usage: r.usage,
+-					stopReason: r.stopReason,
+-					errorMessage: r.errorMessage,
+-				});
++		let response: AssistantMessage;
++		try {
++			response = await callAdvisor();
++		} catch (err) {
++			const message = err instanceof Error ? err.message : String(err);
++			// A thrown account refusal advances; a thrown transport/programming fault
++			// does not — switching accounts cannot repair it and would risk re-sending
++			// a request whose response was merely lost.
++			if (isRetryableAdvisorError(message)) {
++				failures.push({ label, stage: "threw", reason: message });
++				continue;
+ 			}
+-			return undefined;
+-		};
+-
+-		let response = await callAdvisor();
++			return buildErrorResult(label, effort, errCallThrew(message), message);
++		}
+ 
+-		// Aborted/error short-circuit on the first attempt — no retry.
+-		const firstTerminal = stopReasonEnvelope(response);
+-		if (firstTerminal) return firstTerminal;
++		// Evaluation order matters: aborted and error are terminal for THIS candidate
++		// and must be classified BEFORE the empty-text retry below. Otherwise a quota
++		// refusal that carried no text would be retried on the same spent account and
++		// its actionable message replaced by a generic "empty response".
++		if (response.stopReason === "aborted") {
++			return buildAdvisorResult({
++				text: ERR_CALL_ABORTED,
++				effort,
++				advisorLabel: label,
++				usage: response.usage,
++				stopReason: response.stopReason,
++				errorMessage: response.errorMessage ?? ERR_ABORTED_DETAIL,
++			});
++		}
++		if (response.stopReason === "error") {
++			const message = response.errorMessage;
++			if (isRetryableAdvisorError(message)) {
++				failures.push({ label, stage: "call", reason: message ?? ERR_UNKNOWN });
++				continue;
++			}
++			return buildAdvisorResult({
++				text: errCallFailed(message),
++				effort,
++				advisorLabel: label,
++				usage: response.usage,
++				stopReason: response.stopReason,
++				errorMessage: message,
++			});
++		}
+ 
+ 		let advisorText = advisorTextFromResponse(response);
+ 
+ 		// R6.4: a transient empty advisor response (normal stop, no text) gets
+ 		// exactly ONE retry with identical inputs before surfacing as a terminal
+ 		// error. Bounded to a single second call — never a `while`/loop — so a
+-		// persistent-empty provider cannot hot-loop. The retry reuses the SAME
+-		// pre-computed `messages`/`requestOptions` (no re-derivation that could
+-		// diverge from attempt 1), then applies the same three-way route.
++		// persistent-empty provider cannot hot-loop. The retry budget is per
++		// candidate, and no outer loop multiplies it. Unexplained empty output is
++		// NOT an account fault, so it never advances to a sibling.
+ 		if (!advisorText) {
+-			response = await callAdvisor();
++			try {
++				response = await callAdvisor();
++			} catch (err) {
++				const message = err instanceof Error ? err.message : String(err);
++				return buildErrorResult(label, effort, errCallThrew(message), message);
++			}
+ 
+-			const retryTerminal = stopReasonEnvelope(response);
++			const retryTerminal = stopReasonEnvelope(response, label, effort);
+ 			if (retryTerminal) return retryTerminal;
+ 
+ 			advisorText = advisorTextFromResponse(response);
+@@ -207,7 +327,7 @@
+ 				return buildAdvisorResult({
+ 					text: ERR_EMPTY_RESPONSE,
+ 					effort,
+-					advisorLabel,
++					advisorLabel: label,
+ 					usage: response.usage,
+ 					stopReason: response.stopReason,
+ 					errorMessage: ERR_EMPTY_RESPONSE_DETAIL,
+@@ -218,12 +338,18 @@
+ 		return buildAdvisorResult({
+ 			text: advisorText,
+ 			effort,
+-			advisorLabel,
++			advisorLabel: label,
+ 			usage: response.usage,
+ 			stopReason: response.stopReason,
+ 		});
+-	} catch (err) {
+-		const message = err instanceof Error ? err.message : String(err);
+-		return buildErrorResult(advisorLabel, effort, errCallThrew(message), message);
+ 	}
++
++	// Every candidate refused. With a single candidate the original, more specific
++	// error text is preserved verbatim (the common case: one configured advisor,
++	// no siblings); only a genuine multi-account chain is aggregated.
++	const aggregate =
++		failures.length === 1
++			? singleFailureText(failures[0])
++			: errAllCandidatesFailed(failures);
++	return buildErrorResult(advisorLabel, effort, aggregate, aggregate);
+ }
+--- a/advisor/handlers.ts
++++ b/advisor/handlers.ts
+@@ -7,10 +7,44 @@
+ 
+ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+ import { modelKey } from "@juicesharp/rpiv-config";
+-import { ADVISOR_TOOL_NAME, MSG_ADVISOR_DISABLED, msgAdvisorRestored } from "./messages.js";
++import { isLabModeActive } from "./lab-mode.js";
++import {
++	ADVISOR_TOOL_NAME,
++	MSG_ADVISOR_DISABLED,
++	MSG_ADVISOR_LAB_BLOCKED,
++	msgAdvisorRestored,
++} from "./messages.js";
+ import { isExecutorBlocked, isModelBlocked } from "./policy.js";
++import {
++	detectOptInRequest,
++	isSessionOptedIn,
++	recordSessionOptIn,
++} from "./session-optin.js";
+ import { getAdvisorEffort, getAdvisorModel } from "./state.js";
+ 
++/** Status-bar key for the persistent "advisor is on" indicator. */
++export const ADVISOR_STATUS_KEY = "rpiv-advisor";
++
++/**
++ * Refresh the persistent status-bar indicator for the given session.
++ *
++ * The grant is per session, so the indicator must be re-evaluated on every
++ * session_start / grant / revoke rather than set once at load: a session switch
++ * in the same TUI must flip it back off. `undefined` clears the entry.
++ *
++ * Lab mode gets its own text: "off" alone would read as "you have not asked for
++ * it yet", when the real reason is that it is not permitted at all here.
++ */
++export function refreshAdvisorStatus(ctx: ExtensionContext, sessionId: string | undefined): void {
++	if (!ctx?.hasUI) return;
++	if (isLabModeActive()) {
++		ctx.ui.setStatus(ADVISOR_STATUS_KEY, "advisor: off (lab mode)");
++		return;
++	}
++	const on = isSessionOptedIn(sessionId);
++	ctx.ui.setStatus(ADVISOR_STATUS_KEY, on ? "advisor: on" : undefined);
++}
++
+ interface ReconcileNotify {
+ 	/** Shown when the tool is stripped (executor became blocked). */
+ 	disabled: string;
+@@ -24,14 +58,21 @@
+ export function reconcileAdvisorTool(
+ 	pi: ExtensionAPI,
+ 	ctx: ExtensionContext,
+-	opts: { blocked: boolean; notify?: ReconcileNotify },
++	opts: { blocked: boolean; notify?: ReconcileNotify; sessionId?: string },
+ ): void {
++	// The per-session opt-in is orthogonal to every existing block reason and is
++	// ANDed in here so all callers inherit it: a session the user has not
++	// explicitly enabled never gets the tool, whatever else is true. Lab mode is
++	// ANDed in on the same line because it is an absolute prohibition — it must
++	// win over a grant the session already holds.
++	const sessionId = opts.sessionId ?? ctx?.sessionManager?.getSessionId?.();
++	const blocked = opts.blocked || !isSessionOptedIn(sessionId) || isLabModeActive();
+ 	const active = pi.getActiveTools();
+ 	const hasTool = active.includes(ADVISOR_TOOL_NAME);
+-	if (opts.blocked && hasTool) {
++	if (blocked && hasTool) {
+ 		pi.setActiveTools(active.filter((n) => n !== ADVISOR_TOOL_NAME));
+ 		if (opts.notify && ctx.hasUI) ctx.ui.notify(opts.notify.disabled, "info");
+-	} else if (!opts.blocked && !hasTool) {
++	} else if (!blocked && !hasTool) {
+ 		pi.setActiveTools([...active, ADVISOR_TOOL_NAME]);
+ 		if (opts.notify && ctx.hasUI) ctx.ui.notify(opts.notify.restored, "info");
+ 	}
+@@ -39,11 +80,18 @@
+ 
+ export function registerAdvisorBeforeAgentStart(pi: ExtensionAPI): void {
+ 	pi.on("before_agent_start", async (_event, ctx) => {
++		const sessionId = ctx?.sessionManager?.getSessionId?.();
++
++		// Lab mode only suspends: the grant is NOT touched, so leaving lab restores
++		// the previous state automatically. The strip itself happens in
++		// reconcileAdvisorTool below, which ANDs `isLabModeActive()` into blocked.
++
+ 		// No model → blocked (strip); model present → defer to the executor
+ 		// blocklist. Routes through the reconcile hub so all strip/add logic
+ 		// lives in one place rather than re-inlining the filter here.
+ 		const blocked = !getAdvisorModel() || isExecutorBlocked(ctx, pi.getThinkingLevel());
+ 		reconcileAdvisorTool(pi, ctx, { blocked });
++		refreshAdvisorStatus(ctx, sessionId);
+ 	});
+ }
+ 
+@@ -85,3 +133,56 @@
+ 		});
+ 	});
+ }
++
++/**
++ * `input` hook — the per-session opt-in gate.
++ *
++ * Runs before `before_agent_start`, so granting here makes the tool available to
++ * the very turn that asked for it rather than the next one. Returns
++ * `{ action: "continue" }` unconditionally: the user's text is never rewritten,
++ * because `transform` here would collide with any other extension's input
++ * handler and leave a mutated prompt in the transcript.
++ *
++ * `source === "extension"` is skipped so programmatic input (workflow stages,
++ * another extension injecting a prompt) cannot self-grant.
++ */
++export function registerInputOptInHandler(pi: ExtensionAPI): void {
++	pi.on("input", async (event, ctx) => {
++		if (event.source === "extension") return { action: "continue" };
++
++		const sessionId = ctx?.sessionManager?.getSessionId?.();
++		const verdict = detectOptInRequest(event.text);
++		if (!verdict.matched) return { action: "continue" };
++
++		// Lab mode is an absolute prohibition, so the request is refused here
++		// rather than granted-then-stripped: a silent strip would look like the
++		// keyword failed to match, and the user would just repeat it.
++		if (isLabModeActive()) {
++			if (ctx?.hasUI) ctx.ui.notify(MSG_ADVISOR_LAB_BLOCKED, "warning");
++			refreshAdvisorStatus(ctx, sessionId);
++			return { action: "continue" };
++		}
++		if (isSessionOptedIn(sessionId)) return { action: "continue" };
++
++		// Persisted into the session so a reload cannot lose it.
++		recordSessionOptIn(pi, sessionId, true);
++
++		// A grant with no usable advisor model cannot activate anything —
++		// restore.ts owns the "no model" messaging, so only reconcile when a
++		// model is actually selected. Reading it without the guard also made
++		// `modelKey(model)` a non-null assertion over a real undefined case.
++		const advisor = getAdvisorModel();
++		if (advisor) {
++			reconcileAdvisorTool(pi, ctx, {
++				blocked: false,
++				sessionId,
++				notify: {
++					disabled: MSG_ADVISOR_DISABLED,
++					restored: msgAdvisorRestored(modelKey(advisor), getAdvisorEffort()),
++				},
++			});
++		}
++		refreshAdvisorStatus(ctx, sessionId);
++		return { action: "continue" };
++	});
++}
+--- a/advisor/index.ts
++++ b/advisor/index.ts
+@@ -18,22 +18,36 @@
+  *   prompt     — system-prompt loader
+  *   execute    — the advisor side-call
+  *   register   — advisor tool registration
+- *   handlers   — mid-session lifecycle handlers
++ *   handlers   — mid-session lifecycle handlers + the input opt-in gate
++ *   session-optin — per-session activation grant (advisor is off by default)
++ *   lab-mode   — reads the shared lab flag; lab work never gets the advisor
+  *   restore    — session_start restoration
+  *   command    — /advisor slash command
+  */
+ 
+ export { registerAdvisorCommand } from "./command.js";
+-export { loadAdvisorConfig, saveAdvisorConfig } from "./config.js";
++export { loadAdvisorConfig, saveAdvisorConfig, saveAdvisorDefaultEnabled } from "./config.js";
+ export { ensureUserTailForAdvisor, stripInflightAdvisorCall, stripToolDeclarations } from "./context.js";
+ export {
++	refreshAdvisorStatus,
+ 	registerAdvisorBeforeAgentStart,
++	registerInputOptInHandler,
+ 	registerModelSelectHandler,
+ 	registerThinkingLevelSelectHandler,
+ } from "./handlers.js";
+ export { getInventoryMessage, stableStringify } from "./inventory.js";
++export { LAB_MODE_FLAG_PATH, isLabModeActive } from "./lab-mode.js";
+ export { ADVISOR_TOOL_NAME } from "./messages.js";
+ export { setDisabledForModels } from "./policy.js";
++export {
++	detectOptInRequest,
++	isSessionOptedIn,
++	optInSession,
++	recordSessionOptIn,
++	resetSessionOptIn,
++	restoreSessionOptIn,
++	OPTIN_ENTRY_TYPE,
++} from "./session-optin.js";
+ export { DEFAULT_PROMPT_GUIDELINES, DEFAULT_PROMPT_SNIPPET, registerAdvisorTool } from "./register.js";
+ export { __resetAdvisorAnnounced, registerAdvisorSessionStart, restoreAdvisorState } from "./restore.js";
+ export { getAdvisorEffort, getAdvisorModel, setAdvisorEffort, setAdvisorModel } from "./state.js";
+--- a/advisor/messages.ts
++++ b/advisor/messages.ts
+@@ -29,6 +29,26 @@
+ 
+ // Messages (static)
+ export const MSG_ADVISOR_DISABLED = "Advisor disabled";
++/** /advisor off — the session grant is gone, the configured model is untouched. */
++export const msgAdvisorSessionOff = (label: string | undefined) =>
++	label
++		? `Advisor off for this session (model still configured: ${label}) — say "调用 advisor" or run /advisor on to re-enable`
++		: "Advisor off for this session";
++/** /advisor on without a configured model — cannot activate anything. */
++export const MSG_ADVISOR_NO_MODEL_CONFIGURED =
++	"Advisor has no model configured — run /advisor to pick one first";
++/** /advisor always on|off — cross-session default. */
++export const msgAdvisorAlwaysOn = (label: string | undefined) =>
++	label
++		? `Advisor default: ON — new sessions start enabled (${label}). Lab mode still overrides.`
++		: "Advisor default: ON — new sessions start enabled. Lab mode still overrides.";
++export const MSG_ADVISOR_ALWAYS_OFF =
++	"Advisor default: OFF — new sessions start disabled; say \"调用 advisor\" or run /advisor on per session.";
++export const MSG_ADVISOR_ALWAYS_PERSIST_FAILED =
++	"Advisor default not saved — could not write advisor.json";
++/** /advisor on — enabled, but the executor itself is on the blocklist. */
++export const msgAdvisorOnInactive = (label: string, effort: ThinkingLevel | undefined) =>
++	`Advisor enabled for this session: ${label}${effort ? `, ${effort}` : ""} (inactive for current executor)`;
+ export const MSG_REQUIRES_INTERACTIVE = "/advisor requires interactive mode";
+ export const MSG_ADVISOR_NUDGE = "Please advise on the executor's situation above.";
+ export const MSG_EFFORT_NOT_SET = "Effort not set — advisor uses the model default";
+@@ -57,6 +77,16 @@
+ 	`Advisor restored: ${label}${effort ? `, ${effort}` : ""}`;
+ export const msgAdvisorRestoredInactive = (label: string, effort: ThinkingLevel | undefined) =>
+ 	`Advisor restored: ${label}${effort ? `, ${effort}` : ""} (inactive for current executor)`;
++/**
++ * Lab environment refuses the advisor outright — not "not yet enabled", so it
++ * gets its own wording. The advisor would ship the whole lab transcript to an
++ * external model, which is exactly the boundary lab mode exists to keep.
++ */
++export const MSG_ADVISOR_LAB_BLOCKED =
++	"Advisor 不参与 lab 环境：请先执行「退出实验」，再重新要求启用 advisor。";
++/** Session starts with the advisor OFF; the model is configured but not usable until opted in. */
++export const msgAdvisorReadyOptIn = (label: string, effort: ThinkingLevel | undefined) =>
++	`Advisor configured: ${label}${effort ? `, ${effort}` : ""} — off by default; say "调用 advisor" to enable for this session`;
+ export const msgAdvisorEnabledInactive = (label: string, effort: ThinkingLevel | undefined) =>
+ 	`Advisor: ${label}${effort ? `, ${effort}` : ""} (inactive for current executor)`;
+ export const msgConsulting = (label: string, effort: ThinkingLevel | undefined) =>
+--- a/advisor/restore.ts
++++ b/advisor/restore.ts
+@@ -7,15 +7,23 @@
+ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+ import { modelKey, parseModelKey } from "@juicesharp/rpiv-config";
+ import { loadAdvisorConfig, validateDisabledForModels } from "./config.js";
+-import { reconcileAdvisorTool } from "./handlers.js";
++import { reconcileAdvisorTool, refreshAdvisorStatus } from "./handlers.js";
+ import {
+ 	ADVISOR_TOOL_NAME,
+ 	EFFORT_ORDINAL,
+ 	errModelUnavailable,
++	MSG_ADVISOR_LAB_BLOCKED,
++	msgAdvisorReadyOptIn,
+ 	msgAdvisorRestored,
+ 	msgAdvisorRestoredInactive,
+ } from "./messages.js";
++import { isLabModeActive } from "./lab-mode.js";
+ import { isExecutorBlocked, setDisabledForModels } from "./policy.js";
++import {
++	optInSession,
++	resetSessionOptIn,
++	restoreSessionOptIn,
++} from "./session-optin.js";
+ import { setAdvisorEffort, setAdvisorModel } from "./state.js";
+ 
+ /**
+@@ -35,7 +43,40 @@
+ }
+ 
+ export function restoreAdvisorState(ctx: ExtensionContext, pi: ExtensionAPI): void {
++	const sessionId = ctx?.sessionManager?.getSessionId?.();
++
++	// A reload replaces the whole extension runtime, so the in-memory Set is
++	// empty afterwards and this must REBUILD the grant rather than clear it.
++	// Startup/new/resume/fork rebuild the same way: `restoreSessionOptIn` reads
++	// the session's own entries, so a fresh session (no entries) still starts
++	// closed and a reloaded one comes back exactly as it was.
+ 	const config = loadAdvisorConfig();
++	const recorded = restoreSessionOptIn(ctx?.sessionManager, sessionId);
++	if (recorded === undefined) {
++		// No per-session record: fall back to the configured default
++		// (`/advisor always on|off`). Staying silent would make "always on"
++		// indistinguishable from "never asked".
++		resetSessionOptIn(sessionId);
++		if (config.defaultEnabled) optInSession(sessionId);
++	}
++
++	// Lab mode SUSPENDS the advisor; it does not revoke the grant.
++	//
++	// Lab is already ANDed into `reconcileAdvisorTool`'s blocked computation, so
++	// the tool stays stripped for as long as the flag is present and comes back
++	// on its own once it is gone. Recording `{enabled:false}` here would be a
++	// one-way door: the persistent record outranks the configured default, so
++	// "always on" would never recover after leaving lab — which is exactly the
++	// behaviour the user asked for.
++	//
++	// Only an explicit user action (/advisor off, /advisor always off) writes a
++	// false record.
++
++	// Refresh up front: the `deactivate` early-return paths below never reach the
++	// reconcile that would otherwise set it, so a session switch (or a reload in
++	// a host that keeps the status line) would show stale text.
++	refreshAdvisorStatus(ctx, sessionId);
++
+ 
+ 	setDisabledForModels(validateDisabledForModels(config.disabledForModels));
+ 
+@@ -96,6 +137,15 @@
+ 	}
+ 	setAdvisorEffort(effort);
+ 
++	// Lab mode forbids the advisor, so the "say 调用 advisor to enable" hint would
++	// be actively wrong here — say why it is unavailable instead.
++	if (isLabModeActive()) {
++		reconcileAdvisorTool(pi, ctx, { blocked: true, sessionId });
++		refreshAdvisorStatus(ctx, sessionId);
++		notifyOnce(MSG_ADVISOR_LAB_BLOCKED, "warning");
++		return;
++	}
++
+ 	if (isExecutorBlocked(ctx, pi.getThinkingLevel())) {
+ 		reconcileAdvisorTool(pi, ctx, { blocked: true });
+ 		const advisorLabel = modelKey(model);
+@@ -103,16 +153,17 @@
+ 		return;
+ 	}
+ 
+-	const active = pi.getActiveTools();
+-	if (!active.includes(ADVISOR_TOOL_NAME)) {
+-		pi.setActiveTools([...active, ADVISOR_TOOL_NAME]);
+-	}
++	// Route through the reconcile hub instead of adding the tool directly: it is
++	// the single place that applies the per-session opt-in gate, so a bare
++	// setActiveTools here would bypass the gate added for this feature.
++	reconcileAdvisorTool(pi, ctx, { blocked: false, sessionId });
++	refreshAdvisorStatus(ctx, sessionId);
+ 
+-	notifyOnce(msgAdvisorRestored(modelKey(model), effort), "info");
++	notifyOnce(msgAdvisorReadyOptIn(modelKey(model), effort), "info");
+ }
+ 
+ export function registerAdvisorSessionStart(pi: ExtensionAPI): void {
+-	pi.on("session_start", async (_event, ctx) => {
++	pi.on("session_start", async (event, ctx) => {
+ 		restoreAdvisorState(ctx, pi);
+ 	});
+ }
+--- a/index.ts
++++ b/index.ts
+@@ -1,10 +1,15 @@
+ /**
+  * rpiv-advisor — Pi extension
+  *
+- * Registers the `advisor` tool, `/advisor` command, and four lifecycle
+- * hooks (session_start restore, before_agent_start strip, model_select
+- * re-evaluation, thinking_level_select re-evaluation) that together
+- * implement the advisor-strategy pattern.
++ * Registers the `advisor` tool, `/advisor` command, and five lifecycle
++ * hooks (session_start restore, input opt-in gate, before_agent_start strip,
++ * model_select re-evaluation, thinking_level_select re-evaluation) that
++ * together implement the advisor-strategy pattern.
++ *
++ * The advisor is OFF by default in every session. It activates only after the
++ * user explicitly asks for it in that session ("调用 advisor", "请 advisor
++ * 指导一下"), or after running `/advisor` to pick a model. The grant is scoped
++ * to the session id and never persists to disk.
+  *
+  * Config persists at ~/.config/rpiv-advisor/advisor.json. Tool name
+  * preserved verbatim from rpiv-pi@7525a5d.
+@@ -16,6 +21,7 @@
+ 	registerAdvisorCommand,
+ 	registerAdvisorSessionStart,
+ 	registerAdvisorTool,
++	registerInputOptInHandler,
+ 	registerModelSelectHandler,
+ 	registerThinkingLevelSelectHandler,
+ } from "./advisor/index.js";
+@@ -23,6 +29,9 @@
+ export default function (pi: ExtensionAPI) {
+ 	registerAdvisorTool(pi);
+ 	registerAdvisorCommand(pi);
++	// Input gate first: it must be able to grant the session before the
++	// before_agent_start handler reads the grant for the same turn.
++	registerInputOptInHandler(pi);
+ 	registerAdvisorBeforeAgentStart(pi);
+ 	registerModelSelectHandler(pi);
+ 	registerThinkingLevelSelectHandler(pi);
+--- a/prompts/advisor-system.txt
++++ b/prompts/advisor-system.txt
+@@ -3,6 +3,12 @@
+ You read the shared conversation context and return ONE of:
+ - a plan (concrete next steps the executor should take),
+ - a correction (the executor is going down a wrong path — redirect it),
+-- a stop signal (the executor should halt and escalate to the user).
++- a stop signal (the executor should halt the affected action for a decision only the user can make about scope, authorization, significant cost, or irreversible consequences).
+ 
+-You NEVER call tools. You NEVER produce user-facing output. Be concise, directive, and grounded in the shared context. Name files, functions, and line numbers where possible. No preamble, no apologies, no meta-commentary about being an advisor — just the guidance the executor needs.
++You NEVER call tools. You NEVER produce user-facing output. Be concise, directive, and grounded in the shared context. Name files, functions, and line numbers where possible.
++
++Do not invent unseen facts. You see only this conversation branch plus the tool inventory — never the filesystem. Never claim to have read a file, run a command, or observed test output that does not appear in the context above. If the evidence you need is missing, say which specific file, function or command the executor must surface first, instead of guessing at its contents.
++
++The parent owns execution, verification, and user communication: it runs the commands, reads the files, and answers the user. Your guidance is a decision input, not a substitute for that work. Assume unstated details are unverified rather than inferring them.
++
++No preamble, no apologies, no meta-commentary about being an advisor — just the guidance the executor needs.

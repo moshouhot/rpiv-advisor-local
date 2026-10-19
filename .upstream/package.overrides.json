@@ -1,0 +1,28 @@
+{
+  "_comment": "声明式规则：升级时如何从上游 package.json 重建本 fork 的 package.json。由 upgrade-check.mjs 读取。禁止直接把旧 package.json 复制到新版上——版本号和依赖范围每个版本都会变。",
+  "set": {
+    "name": "rpiv-advisor-local",
+    "private": true,
+    "description": "Local maintained fork of @juicesharp/rpiv-advisor with account-level failover, per-session opt-in and a lab-mode prohibition for the advisor side-call."
+  },
+  "versionSuffix": "-personal",
+  "remove": [
+    "author",
+    "repository",
+    "homepage",
+    "bugs",
+    "publishConfig",
+    "scripts",
+    "files"
+  ],
+  "requirePeerDependencies": {
+    "typebox": "*"
+  },
+  "forbiddenDependencies": [
+    "@earendil-works/pi-ai",
+    "@earendil-works/pi-coding-agent",
+    "@earendil-works/pi-tui",
+    "typebox"
+  ],
+  "_forbiddenDependencies_note": "只列「宿主提供、必须为 peer」的包。@juicesharp/rpiv-config 是上游自己声明的普通依赖（runtime dependency），不属于宿主提供，因此不在此列。"
+}

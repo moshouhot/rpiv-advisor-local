@@ -1,0 +1,29 @@
+{
+	"name": "rpiv-advisor-local",
+	"version": "2.13.8-personal",
+	"description": "Local maintained fork of @juicesharp/rpiv-advisor with account-level failover for the advisor side-call.",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"rpiv",
+		"advisor"
+	],
+	"type": "module",
+	"license": "MIT",
+	"pi": {
+		"image": "https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-advisor/docs/cover.png",
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"dependencies": {
+		"@juicesharp/rpiv-config": "^2.13.8"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"typebox": "*"
+	},
+	"private": true
+}

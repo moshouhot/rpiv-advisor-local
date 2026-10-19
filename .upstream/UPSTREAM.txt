@@ -1,0 +1,143 @@
+Upstream base this fork was made from:
+  package : @juicesharp/rpiv-advisor
+  version : 2.13.8
+  source  : ~/.pi/agent/npm/node_modules/@juicesharp/rpiv-advisor (kept pristine, not loaded)
+
+===============================================================================
+WHERE TO START
+===============================================================================
+
+  Upgrading?        -> UPGRADING.md              (mechanical procedure)
+  Rules for AI?     -> AGENTS.md                 (hard constraints)
+  Which files?      -> .upstream/MANIFEST.md     (file classification)
+  Machine-readable? -> .upstream/MANIFEST.json   (sha256 of every file)
+
+  One command does the whole rebuild:
+
+    node upgrade-check.mjs --from <unpacked upstream> --expect-version <ver>
+
+  It stages a candidate under .upgrade-stage/, applies personal.patch with
+  -F0 (no fuzz), regenerates package.json from package.overrides.json, and
+  runs both verification layers THERE. The live plugin is never touched.
+  Exit codes: 0 pass / 1 check failed / 2 cannot build / 3 environment.
+
+===============================================================================
+Files in .upstream/
+===============================================================================
+
+baseline/
+    The COMPLETE upstream 2.13.8 package (23 files, byte-identical to the
+    official npm tarball). Authoritative diff base for every file. The frozen
+    per-file snapshots further down are legacy history only.
+
+personal.patch
+    THE authoritative rebuild asset: 9 files, 952 lines, every local change
+    in one patch. Verified to reproduce this fork BYTE-FOR-BYTE from a clean
+    baseline using `patch -p1 -F0`. If you read only one file here, read this.
+
+package.overrides.json
+    Declarative rules for package.json: rename, -personal version suffix,
+    removal of release-only fields, required peerDependencies. package.json is
+    deliberately NOT in personal.patch — its version and dependency ranges
+    churn every release, so a byte-level patch would conflict every single time
+    and the .rej would carry no useful guidance.
+
+MANIFEST.md / MANIFEST.json
+    Classification (patched 9 / package_metadata 1 / fork_only 12 /
+    unchanged 13 / missing 0) plus sha256 for every file on both sides.
+    NOTE: upgrade-check.mjs derives fork_only FROM DISK, not from this file.
+      disk has it, manifest does not -> warning (manifest needs updating)
+      manifest has it, disk does not -> exit 2 HARD ERROR (asset is missing)
+
+  --- legacy, superseded by baseline/ + personal.patch ---
+
+execute.ts.2.10.1.orig
+    Upstream execute.ts of the ORIGINAL fork base (2.10.1). History only.
+
+execute.ts.2.13.8.orig
+    Upstream execute.ts at 2.13.8. Byte-identical to
+    baseline/advisor/execute.ts; kept because old notes reference this path.
+
+failover-2.13.8.patch
+    execute.ts-only patch — 8 hunks, +178 / -52. Applying it to a clean
+    execute.ts.2.13.8.orig reproduces advisor/execute.ts byte-for-byte.
+    Now a semantic reference (what the failover change actually is, in human
+    readable form). For rebuilding, use personal.patch instead.
+
+prompts/advisor-system.txt.2.13.8.orig
+system-prompt-2.13.8.patch
+    Same idea for the advisor persona: the upstream prompt and the 6-line
+    delta this fork adds. Byte-identical to baseline/prompts/advisor-system.txt.
+
+===============================================================================
+What the fork changes — "same-model cross-account retry"
+===============================================================================
+
+The advisor's completion call uses pi-ai's completeSimple() directly, bypassing
+Pi's agent loop. It therefore emits no message_end / assistant_error events, so
+account-rotation extensions (pi-multi-account) are blind to advisor failures:
+one spent account takes the advisor down while healthy siblings sit idle.
+
+The patch retries the SAME model id on sibling accounts of the same family
+(provider name minus the -account-<N> suffix). It NEVER changes the model.
+
+Four edits in execute.ts (full spec in PERSONAL_MAINTENANCE.md § 改动 B):
+  B1  import from ./fallback.js; drop errNoApiKey, add ERR_UNKNOWN
+  B2  single call -> candidate-chain loop; credentials resolved PER CANDIDATE
+  B3  per-attempt order: aborted -> error -> empty-response
+  B4  exhausted chain aggregates; single-candidate keeps original wording
+
+Plus the fork-only file advisor/fallback.ts (candidate builder + narrow
+classifier + aggregation). Upstream does not ship it, so `cp *.ts` never
+clobbers it.
+
+Beyond failover, the fork also adds three subsystems upstream does not have —
+per-session opt-in, lab-mode hard block, and /advisor on|off|always. See
+PERSONAL_MAINTENANCE.md 改动 C-G. These live in fork-only files
+(advisor/session-optin.ts, advisor/lab-mode.ts) plus edits to the 9 patched
+files in MANIFEST.md's A-class table.
+
+===============================================================================
+To diff the fork against its current base
+===============================================================================
+
+  cd ~/.pi/agent/local-plugins/rpiv-advisor-local
+
+  # everything the fork changed, as one patch
+  cat .upstream/personal.patch
+
+  # just execute.ts (the failover subsystem)
+  diff -u .upstream/baseline/advisor/execute.ts advisor/execute.ts
+
+  # has the live plugin drifted from what the assets claim?
+  node check-upstream-merge.mjs      # 43 static assertions
+  node run-tests.mjs                 # 24 failover + 31 opt-in/lab
+
+===============================================================================
+Upgrade history
+===============================================================================
+
+  2.10.1 -> 2.13.8 (2026-10-17)
+    Upstream changed exactly 5 files:
+      advisor/context.ts        NEW stripToolDeclarations() (#295)
+      advisor/execute.ts        pipeline now routes through it
+      advisor/index.ts          re-export
+      docs/tool-reference.md    doc sync
+      package.json              typebox: dependencies -> peerDependencies:"*" (#282)
+    The only execute.ts change was #295. Re-applied on top of the failover
+    patch by hand. Verified with check-upstream-merge.mjs.
+
+    NOTE #295 is easy to lose: it is an UPSTREAM addition living inside the
+    same file region this fork rewrites. check-upstream-merge.mjs asserts it
+    is still present.
+
+  2.13.8 -> (frozen assets, 2026-10-18)
+    No upstream change. The upgrade path itself was hardened:
+      .upstream/baseline/           full 23-file npm snapshot, not just .ts
+      .upstream/personal.patch      9 files / 952 lines, byte-exact rebuild
+      .upstream/package.overrides.json
+      .upstream/MANIFEST.md|json    classification + per-file sha256
+      AGENTS.md / UPGRADING.md      AI-facing rules and procedure
+      upgrade-check.mjs             stage -> patch -> verify, exits 0/1/2/3
+    Previously only 2 of the 9 modified files had frozen patches; the other 7
+    had to be re-applied by hand from prose. That gap is now closed.

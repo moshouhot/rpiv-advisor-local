@@ -1,0 +1,10 @@
+# 本仓库所有文件在 git 内统一存 LF，检出时不转换。
+# 原因：.upstream/personal.patch 必须字节级可重放（patch -p1 -F0），
+# CRLF 会让每个 hunk 失配；JSON/Markdown 也受 windows-file-format 门禁约束。
+* text=auto eol=lf
+
+# 二进制资产不做任何转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.zip binary
